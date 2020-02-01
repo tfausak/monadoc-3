@@ -161,10 +161,15 @@ to download all that from hackage again, but there's no point.
   say when the index was updated, when various packages were uploaded, and so
   on. (how much smaller would the various tarballs be if all the times were set
   to the unix epoch?)
+  for each entry in the index, the `entryTime` is set to when the package was
+  uploaded, not when the tarball was created.
 
 - [ ] we should probably track hackage metadata, like who uploaded a package
   and who can maintain it. unfortunately this information isn't in the index.
   we'll have to query separately for it.
+  for each entry in the index, the `entryOwnership` -> `ownerName` is the
+  hackage username of the uploader. maintainers are only available through the
+  hackage api.
 
 - [ ] what will happen in the unlikely scenario where hackage deletes a package
   from the index and rebases? will we continue to show the package? will we
@@ -172,9 +177,13 @@ to download all that from hackage again, but there's no point.
   packages that used to work.) in other words, everything we're doing now is
   additive. we'll need some way to recognize that things have gone away.
 
-- [ ] technically the index is (usually) append only, and hackage supports
+- [x] technically the index is (usually) append only, and hackage supports
   range requests. we might be able to avoid re-downloading the entire index
   whenever anything changes. is that worthwhile?
+
+  no, probably not. the whole index is relatively small: 82mb. since the whole
+  index can be rebased, being defensive and always downloading the whole thing
+  feels safer.
 
 - [x] figure out why it takes so long to iterate over all package contents.
   also why the sqlite database size keeps growing.
@@ -189,22 +198,30 @@ to download all that from hackage again, but there's no point.
 - [ ] get a list of all the components of each package. for example there could
   be the default library component, named libraries (since cabal ~~3~~ _2.2_),
   executables, test suites, and benchmarks. anything else?
-  - condLibrary
-  - condSubLibraries
-  - condForeignLibs
-  - condExecutables
-  - condTestSuites
-  - condBenchmarks
+  - condLibrary (pkg:lib)
+  - condSubLibraries (pkg:lib:blah)
+  - condForeignLibs (?)
+  - condExecutables (pkg:exe:blah)
+  - condTestSuites (pkg:test:blah)
+  - condBenchmarks (pkg:bench:blah)
 
 - [ ] for each library component, figure out which modules it exports. doing
   this may involve selecting flags and other build time constraints (like
   platform or operating system).
+  if you ignore conditionals, this is easy. taking conditionals into account
+  would require chasing down `condTreeComponents`. maybe it makes sense to
+  build the superset of all possibly exposed modules?
 
 - [ ] parsing the haskell sources is (way, way) more complicated. just getting
   ghc going shouldn't be too bad. this post is a good start:
   https://blog.shaynefletcher.org/2019/06/harvesting-annotations-from-ghc-parser.html
   however it's important to note that we're not trying to actually build
   the package. all we want to do is parse the source and extract comments.
+
+  note that we'll want to use the latest ghc to parse source files, but it's
+  not available on hackage. that means we'll need to upgrade our compiler so
+  that we get the wired in package. (can you even reinstall the `ghc` package
+  anyway?) https://github.com/haskell-infra/hackage-trustees/issues/240
 
 -}
 
