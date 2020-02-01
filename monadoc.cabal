@@ -1,0 +1,32 @@
+name: monadoc
+version: 0
+
+build-type: Simple
+cabal-version: >= 1.2
+
+executable monadoc
+  build-depends:
+    base
+    , aeson
+    , async
+    , bytestring
+    , Cabal
+    , containers
+    , cryptonite
+    , filepath
+    , ghc
+    , http-client
+    , http-client-tls
+    , http-types
+    , lucid
+    , memory
+    , sqlite-simple
+    , stm
+    , tar
+    , text
+    , time
+    , wai
+    , wai-extra
+    , warp
+    , zlib
+  main-is: Main.hs
