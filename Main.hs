@@ -151,6 +151,11 @@ to download all that from hackage again, but there's no point.
   for all the found ones anyway. i'm not planning on running the c pre
   processor or template haskell.
 
+- in theory it should be possible to parse each haskell file at most once. or
+  maybe once per unique subset of the build info: default language, language
+  extensions, and ghc options. that could save a lot of time that would be
+  spent re-parsing modules between revisions.
+
 ## todo ##
 
 - [ ] add size to blobs
@@ -248,8 +253,10 @@ import Data.List
 import qualified Data.Set as S
 import qualified Data.Text as T
 import Data.Text.Encoding
+import Data.Text.Encoding.Error
 import Data.Time
 import Database.SQLite.Simple
+import Debug.Trace
 import Distribution.ModuleName hiding (main)
 import Distribution.PackageDescription.Parsec
 import Distribution.Parsec
@@ -263,6 +270,13 @@ import Distribution.Types.PackageName
 import Distribution.Types.PackageVersionConstraint
 import Distribution.Types.Version
 import Distribution.Types.VersionRange
+import DynFlags as Ghc
+import FastString
+import Fingerprint
+import GHC.LanguageExtensions.Type as Ghc
+import HeaderInfo
+import Language.Haskell.Extension as Cabal
+import Lexer
 import Lucid
 import Network.HTTP.Client hiding (decompress, withConnection)
 import Network.HTTP.Client.TLS
@@ -272,7 +286,11 @@ import Network.Wai hiding (requestHeaders, responseHeaders, responseStatus)
 import Network.Wai.Handler.Warp
 import Network.Wai.Middleware.RequestLogger
 import Numeric.Natural
+import Parser
+import Platform
 import Prelude hiding (read)
+import SrcLoc
+import StringBuffer
 import System.FilePath
 import System.IO
 import System.IO.Unsafe
@@ -321,14 +339,14 @@ worker connection = do
 
     puts "pruning orphan blobs"
     digests <- do
-      var <- newTVarIO (S.empty :: S.Set T.Text)
-      rows <- query_ connection "select digest from indices"
-      atomically . modifyTVar' var . S.union . S.fromList $ fmap fromOnly rows
-      rows <- query_ connection "select digest from packages"
-      atomically . modifyTVar' var . S.union . S.fromList $ fmap fromOnly rows
-      rows <- query_ connection "select digest from tarballs"
-      atomically . modifyTVar' var . S.union . S.fromList $ fmap fromOnly rows
-      readTVarIO var
+      digestsVar <- newTVarIO (S.empty :: S.Set T.Text)
+      indexDigests <- query_ connection "select digest from indices"
+      atomically . modifyTVar' digestsVar . S.union . S.fromList $ fmap fromOnly indexDigests
+      packageDigests <- query_ connection "select digest from packages"
+      atomically . modifyTVar' digestsVar . S.union . S.fromList $ fmap fromOnly packageDigests
+      tarballDigests <- query_ connection "select digest from tarballs"
+      atomically . modifyTVar' digestsVar . S.union . S.fromList $ fmap fromOnly tarballDigests
+      readTVarIO digestsVar
     fold_ connection "select digest from blobs" () $ \ () (Only digest) ->
       unless (S.member digest digests) $
         execute connection "delete from blobs where digest = ?" $ Only digest
@@ -476,10 +494,11 @@ worker connection = do
     rows <- query_ connection
       "select name, version, revision, digest from packages\
       \ order by name asc, version asc, revision asc\
-      \ /* limit 100 /* TODO */"
-    foundVar <- newTVarIO (0 :: Natural)
-    lostVar <- newTVarIO (0 :: Natural)
+      \ limit 100 /* TODO */"
+    goodVar <- newTVarIO (0 :: Natural)
+    badVar <- newTVarIO (0 :: Natural)
     forM_ rows $ \ (name, version, revision, packageDigest) -> do
+      puts $ unwords [ name, version, show revision ]
       [Only package] <- query connection
         "select content from blobs where digest = ?" $ Only packageDigest
       [Only tarballDigest] <- query connection
@@ -496,7 +515,7 @@ worker connection = do
         packageId = name ++ "-" ++ version
         Just gpd = parseGenericPackageDescriptionMaybe package
       nameVar <- newEmptyTMVarIO
-      filesVar <- newTVarIO S.empty
+      filesVar <- newTVarIO M.empty
       foldEntries
         (\ entry action -> do
           let path = entryPath entry
@@ -510,7 +529,7 @@ worker connection = do
                 NormalFile content _ -> do
                   maybeName <- atomically $ tryTakeTMVar nameVar
                   let fullPath = fromMaybe path maybeName
-                  atomically . modifyTVar' filesVar $ S.insert fullPath
+                  atomically . modifyTVar' filesVar $ M.insert fullPath content
                 OtherEntryType '5' _ _ -> pure ()
                 OtherEntryType 'g' _ _ -> pure ()
                 OtherEntryType 'L' content _ -> do
@@ -544,29 +563,386 @@ worker connection = do
       case condLibrary gpd of
         Nothing -> pure ()
         Just lib -> do
+          modsVar <- newTVarIO M.empty
           files <- readTVarIO filesVar
           let
-            dirs = fmap (combine packageId) $
-              case hsSourceDirs . libBuildInfo $ condTreeData lib of
+            buildInfo = libBuildInfo $ condTreeData lib
+            packageDynFlags = foldr
+              (\ ext flg -> case ext of
+                EnableExtension x -> xopt_set flg $ cabalExtensionToGhcExtension x
+                DisableExtension x -> xopt_unset flg $ cabalExtensionToGhcExtension x
+                _ -> error $ show ext)
+              (lang_set dynFlags . fmap cabalLanguageToGhcLanguage $ defaultLanguage buildInfo)
+              $ defaultExtensions buildInfo <> oldExtensions buildInfo
+            dirs = fmap (normalise . combine packageId) $
+              case hsSourceDirs $ buildInfo of
                 [] -> ["."]
                 xs -> xs
-            exts = [ "hs", "lhs", "hsc", "chs" ]
-            (found, lost) = partition
-              (\ mod -> any (flip S.member files)
-                . fmap normalise
-                . concatMap (\ f -> fmap (flip combine f) dirs)
-                $ fmap (addExtension $ toFilePath mod) exts)
-              . exposedModules $ condTreeData lib
-          atomically $ do
-            modifyTVar' foundVar (+ fromIntegral (length found))
-            modifyTVar' lostVar (+ fromIntegral (length lost))
-    found <- readTVarIO foundVar
-    lost <- readTVarIO lostVar
-    print ("found", found)
-    print ("lost", lost)
+            exts = [ "hs" {- , "lhs", "hsc", "chs" -} ]
+          forM_ (exposedModules $ condTreeData lib) $ \ mod -> do
+            atomically
+              . modifyTVar' modsVar
+              . M.insert mod
+              . find (\ path -> M.member path files)
+              . concatMap (\ file -> fmap (\ dir -> combine dir file) dirs)
+              $ fmap (\ ext -> addExtension (toFilePath mod) ext) exts
+          mods <- readTVarIO modsVar
+          forM_ (M.toList mods) $ \ (mod, maybePath) -> case maybePath of
+            Nothing -> pure () -- TODO: couldn't find module source
+            Just filePath -> case M.lookup filePath files of
+              Nothing -> fail $ "module mapped to file that doesn't exist " <> show (mod, maybePath, files)
+              Just content -> handle (\ e -> hPrint stderr (name, version, revision, mod, filePath, e :: SomeException)) $ do
+                let
+                  -- TODO: do haskell source files have to be utf-8?
+                  stringBuffer :: StringBuffer
+                  stringBuffer = stringToStringBuffer . T.unpack . decodeUtf8With lenientDecode $ L.toStrict content
+                  options :: [Located String]
+                  options = getOptions packageDynFlags stringBuffer filePath
+                  realSrcLoc :: RealSrcLoc
+                  realSrcLoc = mkRealSrcLoc (mkFastString filePath) 1 1
+                (modDynFlags, _, _) <- parseDynamicFilePragma packageDynFlags options
+                let
+                  pState :: PState
+                  pState = mkPState modDynFlags stringBuffer realSrcLoc
+                case unP parseModule pState of
+                  -- TODO
+                  PFailed _ _ _ -> atomically $ modifyTVar' badVar (+ 1)
+                  POk _ _ -> atomically $ modifyTVar' goodVar (+ 1)
+    good <- readTVarIO goodVar
+    bad <- readTVarIO badVar
+    print ("good", good, "bad", bad)
 
     puts "worker finished, waiting one minute"
     threadDelay 60000000
+
+platform :: Platform
+platform = Platform
+  { platformArch = ArchUnknown
+  , platformHasGnuNonexecStack = False
+  , platformHasIdentDirective = False
+  , platformHasSubsectionsViaSymbols = False
+  , platformIsCrossCompiling = False
+  , platformOS = OSUnknown
+  , platformUnregisterised = True
+  , platformWordSize = 0
+  }
+
+platformConstants :: PlatformConstants
+platformConstants = PlatformConstants
+  { pc_AP_STACK_SPLIM = 0
+  , pc_BITMAP_BITS_SHIFT = 0
+  , pc_BLOCK_SIZE = 0
+  , pc_BLOCKS_PER_MBLOCK = 0
+  , pc_CINT_SIZE = 0
+  , pc_CLONG_LONG_SIZE = 0
+  , pc_CLONG_SIZE = 0
+  , pc_CONTROL_GROUP_CONST_291 = 0
+  , pc_DOUBLE_SIZE = 0
+  , pc_DYNAMIC_BY_DEFAULT = False
+  , pc_ILDV_CREATE_MASK = 0
+  , pc_ILDV_STATE_CREATE = 0
+  , pc_ILDV_STATE_USE = 0
+  , pc_LDV_SHIFT = 0
+  , pc_MAX_CHARLIKE = 0
+  , pc_MAX_Double_REG = 0
+  , pc_MAX_Float_REG = 0
+  , pc_MAX_INTLIKE = 0
+  , pc_MAX_Long_REG = 0
+  , pc_MAX_Real_Double_REG = 0
+  , pc_MAX_Real_Float_REG = 0
+  , pc_MAX_Real_Long_REG = 0
+  , pc_MAX_Real_Vanilla_REG = 0
+  , pc_MAX_Real_XMM_REG = 0
+  , pc_MAX_SPEC_AP_SIZE = 0
+  , pc_MAX_SPEC_SELECTEE_SIZE = 0
+  , pc_MAX_Vanilla_REG = 0
+  , pc_MAX_XMM_REG = 0
+  , pc_MIN_CHARLIKE = 0
+  , pc_MIN_INTLIKE = 0
+  , pc_MIN_PAYLOAD_SIZE = 0
+  , pc_MUT_ARR_PTRS_CARD_BITS = 0
+  , pc_OFFSET_bdescr_blocks = 0
+  , pc_OFFSET_bdescr_flags = 0
+  , pc_OFFSET_bdescr_free = 0
+  , pc_OFFSET_bdescr_start = 0
+  , pc_OFFSET_Capability_r = 0
+  , pc_OFFSET_CostCentreStack_mem_alloc = 0
+  , pc_OFFSET_CostCentreStack_scc_count = 0
+  , pc_OFFSET_StgArrBytes_bytes = 0
+  , pc_OFFSET_stgEagerBlackholeInfo = 0
+  , pc_OFFSET_StgEntCounter_allocd = 0
+  , pc_OFFSET_StgEntCounter_allocs = 0
+  , pc_OFFSET_StgEntCounter_entry_count = 0
+  , pc_OFFSET_StgEntCounter_link = 0
+  , pc_OFFSET_StgEntCounter_registeredp = 0
+  , pc_OFFSET_StgFunInfoExtraFwd_arity = 0
+  , pc_OFFSET_StgFunInfoExtraRev_arity = 0
+  , pc_OFFSET_stgGCEnter1 = 0
+  , pc_OFFSET_stgGCFun = 0
+  , pc_OFFSET_StgHeader_ccs = 0
+  , pc_OFFSET_StgHeader_ldvw = 0
+  , pc_OFFSET_StgMutArrPtrs_ptrs = 0
+  , pc_OFFSET_StgMutArrPtrs_size = 0
+  , pc_OFFSET_StgRegTable_rCCCS = 0
+  , pc_OFFSET_StgRegTable_rCurrentNursery = 0
+  , pc_OFFSET_StgRegTable_rCurrentTSO = 0
+  , pc_OFFSET_StgRegTable_rD1 = 0
+  , pc_OFFSET_StgRegTable_rD2 = 0
+  , pc_OFFSET_StgRegTable_rD3 = 0
+  , pc_OFFSET_StgRegTable_rD4 = 0
+  , pc_OFFSET_StgRegTable_rD5 = 0
+  , pc_OFFSET_StgRegTable_rD6 = 0
+  , pc_OFFSET_StgRegTable_rF1 = 0
+  , pc_OFFSET_StgRegTable_rF2 = 0
+  , pc_OFFSET_StgRegTable_rF3 = 0
+  , pc_OFFSET_StgRegTable_rF4 = 0
+  , pc_OFFSET_StgRegTable_rF5 = 0
+  , pc_OFFSET_StgRegTable_rF6 = 0
+  , pc_OFFSET_StgRegTable_rHp = 0
+  , pc_OFFSET_StgRegTable_rHpAlloc = 0
+  , pc_OFFSET_StgRegTable_rHpLim = 0
+  , pc_OFFSET_StgRegTable_rL1 = 0
+  , pc_OFFSET_StgRegTable_rR1 = 0
+  , pc_OFFSET_StgRegTable_rR10 = 0
+  , pc_OFFSET_StgRegTable_rR2 = 0
+  , pc_OFFSET_StgRegTable_rR3 = 0
+  , pc_OFFSET_StgRegTable_rR4 = 0
+  , pc_OFFSET_StgRegTable_rR5 = 0
+  , pc_OFFSET_StgRegTable_rR6 = 0
+  , pc_OFFSET_StgRegTable_rR7 = 0
+  , pc_OFFSET_StgRegTable_rR8 = 0
+  , pc_OFFSET_StgRegTable_rR9 = 0
+  , pc_OFFSET_StgRegTable_rSp = 0
+  , pc_OFFSET_StgRegTable_rSpLim = 0
+  , pc_OFFSET_StgRegTable_rXMM1 = 0
+  , pc_OFFSET_StgRegTable_rXMM2 = 0
+  , pc_OFFSET_StgRegTable_rXMM3 = 0
+  , pc_OFFSET_StgRegTable_rXMM4 = 0
+  , pc_OFFSET_StgRegTable_rXMM5 = 0
+  , pc_OFFSET_StgRegTable_rXMM6 = 0
+  , pc_OFFSET_StgRegTable_rYMM1 = 0
+  , pc_OFFSET_StgRegTable_rYMM2 = 0
+  , pc_OFFSET_StgRegTable_rYMM3 = 0
+  , pc_OFFSET_StgRegTable_rYMM4 = 0
+  , pc_OFFSET_StgRegTable_rYMM5 = 0
+  , pc_OFFSET_StgRegTable_rYMM6 = 0
+  , pc_OFFSET_StgRegTable_rZMM1 = 0
+  , pc_OFFSET_StgRegTable_rZMM2 = 0
+  , pc_OFFSET_StgRegTable_rZMM3 = 0
+  , pc_OFFSET_StgRegTable_rZMM4 = 0
+  , pc_OFFSET_StgRegTable_rZMM5 = 0
+  , pc_OFFSET_StgRegTable_rZMM6 = 0
+  , pc_OFFSET_StgSmallMutArrPtrs_ptrs = 0
+  , pc_OFFSET_StgStack_sp = 0
+  , pc_OFFSET_StgStack_stack = 0
+  , pc_OFFSET_StgTSO_alloc_limit = 0
+  , pc_OFFSET_StgTSO_cccs = 0
+  , pc_OFFSET_StgTSO_stackobj = 0
+  , pc_OFFSET_StgUpdateFrame_updatee = 0
+  , pc_platformConstants = ()
+  , pc_PROF_HDR_SIZE = 0
+  , pc_REP_CostCentreStack_mem_alloc = 0
+  , pc_REP_CostCentreStack_scc_count = 0
+  , pc_REP_StgEntCounter_allocd = 0
+  , pc_REP_StgEntCounter_allocs = 0
+  , pc_REP_StgFunInfoExtraFwd_arity = 0
+  , pc_REP_StgFunInfoExtraRev_arity = 0
+  , pc_RESERVED_C_STACK_BYTES = 0
+  , pc_RESERVED_STACK_WORDS = 0
+  , pc_SIZEOF_CostCentreStack = 0
+  , pc_SIZEOF_StgArrBytes_NoHdr = 0
+  , pc_SIZEOF_StgFunInfoExtraRev = 0
+  , pc_SIZEOF_StgMutArrPtrs_NoHdr = 0
+  , pc_SIZEOF_StgSmallMutArrPtrs_NoHdr = 0
+  , pc_SIZEOF_StgSMPThunkHeader = 0
+  , pc_SIZEOF_StgUpdateFrame_NoHdr = 0
+  , pc_STD_HDR_SIZE = 0
+  , pc_TAG_BITS = 0
+  , pc_TICKY_BIN_COUNT = 0
+  , pc_WORD_SIZE = 0
+  , pc_WORDS_BIGENDIAN = False
+  }
+
+settings :: Ghc.Settings
+settings = Ghc.Settings
+  { sExtraGccViaCFlags = []
+  , sGccSupportsNoPie = False
+  , sGhciUsagePath = ""
+  , sGhcUsagePath = ""
+  , sLdIsGnuLd = False
+  , sLdSupportsBuildId = False
+  , sLdSupportsCompactUnwind = False
+  , sLdSupportsFilelist = False
+  , sOpt_a = []
+  , sOpt_c = []
+  , sOpt_F = []
+  , sOpt_i = []
+  , sOpt_l = []
+  , sOpt_L = []
+  , sOpt_lc = []
+  , sOpt_lcc = []
+  , sOpt_lo = []
+  , sOpt_P = []
+  , sOpt_P_fingerprint = fingerprint0
+  , sOpt_windres = []
+  , sPgm_a = ("", [])
+  , sPgm_ar = ""
+  , sPgm_c = ("", [])
+  , sPgm_dll = ("", [])
+  , sPgm_F = ""
+  , sPgm_i = ""
+  , sPgm_l = ("", [])
+  , sPgm_L = ""
+  , sPgm_lc = ("", [])
+  , sPgm_lcc = ("", [])
+  , sPgm_libtool = ""
+  , sPgm_lo = ("", [])
+  , sPgm_P = ("", [])
+  , sPgm_ranlib = ""
+  , sPgm_s = ("", [])
+  , sPgm_T = ""
+  , sPgm_windres = ""
+  , sPlatformConstants = platformConstants
+  , sProgramName = ""
+  , sProjectVersion = ""
+  , sRawSettings = []
+  , sSystemPackageConfig = ""
+  , sTargetPlatform = platform
+  , sTmpDir = ""
+  , sToolDir = Nothing
+  , sTopDir = ""
+  }
+
+llvmConfig :: LlvmConfig
+llvmConfig = ([], [])
+
+dynFlags :: DynFlags
+dynFlags = defaultDynFlags Main.settings llvmConfig
+
+cabalLanguageToGhcLanguage x = case x of
+  Cabal.Haskell98 -> Ghc.Haskell98
+  Cabal.Haskell2010 -> Ghc.Haskell2010
+  _ -> error $ "cabalLanguageToGhcLanguage: " <> show x
+
+cabalExtensionToGhcExtension x = case x of
+  Cabal.AllowAmbiguousTypes -> Ghc.AllowAmbiguousTypes
+  Cabal.ApplicativeDo -> Ghc.ApplicativeDo
+  Cabal.Arrows -> Ghc.Arrows
+  Cabal.AutoDeriveTypeable -> Ghc.AutoDeriveTypeable
+  Cabal.BangPatterns -> Ghc.BangPatterns
+  Cabal.BinaryLiterals -> Ghc.BinaryLiterals
+  Cabal.BlockArguments -> Ghc.BlockArguments
+  Cabal.CApiFFI -> Ghc.CApiFFI
+  Cabal.ConstrainedClassMethods -> Ghc.ConstrainedClassMethods
+  Cabal.ConstraintKinds -> Ghc.ConstraintKinds
+  Cabal.CPP -> Ghc.Cpp
+  Cabal.DataKinds -> Ghc.DataKinds
+  Cabal.DatatypeContexts -> Ghc.DatatypeContexts
+  Cabal.DefaultSignatures -> Ghc.DefaultSignatures
+  Cabal.DeriveAnyClass -> Ghc.DeriveAnyClass
+  Cabal.DeriveDataTypeable -> Ghc.DeriveDataTypeable
+  Cabal.DeriveFoldable -> Ghc.DeriveFoldable
+  Cabal.DeriveFunctor -> Ghc.DeriveFunctor
+  Cabal.DeriveGeneric -> Ghc.DeriveGeneric
+  Cabal.DeriveLift -> Ghc.DeriveLift
+  Cabal.DeriveTraversable -> Ghc.DeriveTraversable
+  Cabal.DerivingStrategies -> Ghc.DerivingStrategies
+  Cabal.DerivingVia -> Ghc.DerivingVia
+  Cabal.DisambiguateRecordFields -> Ghc.DisambiguateRecordFields
+  Cabal.DoAndIfThenElse -> Ghc.DoAndIfThenElse
+  Cabal.DuplicateRecordFields -> Ghc.DuplicateRecordFields
+  Cabal.EmptyCase -> Ghc.EmptyCase
+  Cabal.EmptyDataDecls -> Ghc.EmptyDataDecls
+  Cabal.EmptyDataDeriving -> Ghc.EmptyDataDeriving
+  Cabal.ExistentialQuantification -> Ghc.ExistentialQuantification
+  Cabal.ExplicitForAll -> Ghc.ExplicitForAll
+  Cabal.ExplicitNamespaces -> Ghc.ExplicitNamespaces
+  Cabal.ExtendedDefaultRules -> Ghc.ExtendedDefaultRules
+  Cabal.FlexibleContexts -> Ghc.FlexibleContexts
+  Cabal.FlexibleInstances -> Ghc.FlexibleInstances
+  Cabal.ForeignFunctionInterface -> Ghc.ForeignFunctionInterface
+  Cabal.FunctionalDependencies -> Ghc.FunctionalDependencies
+  Cabal.GADTs -> Ghc.GADTs
+  Cabal.GADTSyntax -> Ghc.GADTSyntax
+  Cabal.GeneralizedNewtypeDeriving -> Ghc.GeneralizedNewtypeDeriving
+  Cabal.GHCForeignImportPrim -> Ghc.GHCForeignImportPrim
+  Cabal.HexFloatLiterals -> Ghc.HexFloatLiterals
+  Cabal.ImplicitParams -> Ghc.ImplicitParams
+  Cabal.ImplicitPrelude -> Ghc.ImplicitPrelude
+  Cabal.ImpredicativeTypes -> Ghc.ImpredicativeTypes
+  Cabal.IncoherentInstances -> Ghc.IncoherentInstances
+  Cabal.InstanceSigs -> Ghc.InstanceSigs
+  Cabal.InterruptibleFFI -> Ghc.InterruptibleFFI
+  Cabal.JavaScriptFFI -> Ghc.JavaScriptFFI
+  Cabal.KindSignatures -> Ghc.KindSignatures
+  Cabal.LambdaCase -> Ghc.LambdaCase
+  Cabal.LiberalTypeSynonyms -> Ghc.LiberalTypeSynonyms
+  Cabal.MagicHash -> Ghc.MagicHash
+  Cabal.MonadComprehensions -> Ghc.MonadComprehensions
+  Cabal.MonadFailDesugaring -> Ghc.MonadFailDesugaring
+  Cabal.MonoLocalBinds -> Ghc.MonoLocalBinds
+  Cabal.MonomorphismRestriction -> Ghc.MonomorphismRestriction
+  Cabal.MonoPatBinds -> Ghc.MonoPatBinds
+  Cabal.MultiParamTypeClasses -> Ghc.MultiParamTypeClasses
+  Cabal.MultiWayIf -> Ghc.MultiWayIf
+  Cabal.NamedWildCards -> Ghc.NamedWildCards
+  Cabal.NegativeLiterals -> Ghc.NegativeLiterals
+  Cabal.NondecreasingIndentation -> Ghc.NondecreasingIndentation
+  Cabal.NPlusKPatterns -> Ghc.NPlusKPatterns
+  Cabal.NullaryTypeClasses -> Ghc.NullaryTypeClasses
+  Cabal.NumDecimals -> Ghc.NumDecimals
+  Cabal.NumericUnderscores -> Ghc.NumericUnderscores
+  Cabal.OverlappingInstances -> Ghc.OverlappingInstances
+  Cabal.OverloadedLabels -> Ghc.OverloadedLabels
+  Cabal.OverloadedLists -> Ghc.OverloadedLists
+  Cabal.OverloadedStrings -> Ghc.OverloadedStrings
+  Cabal.PackageImports -> Ghc.PackageImports
+  Cabal.ParallelArrays -> Ghc.ParallelArrays
+  Cabal.ParallelListComp -> Ghc.ParallelListComp
+  Cabal.PartialTypeSignatures -> Ghc.PartialTypeSignatures
+  Cabal.PatternGuards -> Ghc.PatternGuards
+  Cabal.PatternSynonyms -> Ghc.PatternSynonyms
+  Cabal.PolyKinds -> Ghc.PolyKinds
+  Cabal.PostfixOperators -> Ghc.PostfixOperators
+  Cabal.QuantifiedConstraints -> Ghc.QuantifiedConstraints
+  Cabal.QuasiQuotes -> Ghc.QuasiQuotes
+  Cabal.RankNTypes -> Ghc.RankNTypes
+  Cabal.RebindableSyntax -> Ghc.RebindableSyntax
+  Cabal.RecordPuns -> Ghc.RecordPuns
+  Cabal.RecordWildCards -> Ghc.RecordWildCards
+  Cabal.RecursiveDo -> Ghc.RecursiveDo
+  Cabal.RelaxedPolyRec -> Ghc.RelaxedPolyRec
+  Cabal.RoleAnnotations -> Ghc.RoleAnnotations
+  Cabal.ScopedTypeVariables -> Ghc.ScopedTypeVariables
+  Cabal.StandaloneDeriving -> Ghc.StandaloneDeriving
+  Cabal.StarIsType -> Ghc.StarIsType
+  Cabal.StaticPointers -> Ghc.StaticPointers
+  Cabal.Strict -> Ghc.Strict
+  Cabal.StrictData -> Ghc.StrictData
+  Cabal.TemplateHaskell -> Ghc.TemplateHaskell
+  Cabal.TemplateHaskellQuotes -> Ghc.TemplateHaskellQuotes
+  Cabal.TraditionalRecordSyntax -> Ghc.TraditionalRecordSyntax
+  Cabal.TransformListComp -> Ghc.TransformListComp
+  Cabal.TupleSections -> Ghc.TupleSections
+  Cabal.TypeApplications -> Ghc.TypeApplications
+  Cabal.TypeFamilies -> Ghc.TypeFamilies
+  Cabal.TypeFamilyDependencies -> Ghc.TypeFamilyDependencies
+  Cabal.TypeInType -> Ghc.TypeInType
+  Cabal.TypeOperators -> Ghc.TypeOperators
+  Cabal.TypeSynonymInstances -> Ghc.TypeSynonymInstances
+  Cabal.UnboxedSums -> Ghc.UnboxedSums
+  Cabal.UnboxedTuples -> Ghc.UnboxedTuples
+  Cabal.UndecidableInstances -> Ghc.UndecidableInstances
+  Cabal.UndecidableSuperClasses -> Ghc.UndecidableSuperClasses
+  Cabal.UnicodeSyntax -> Ghc.UnicodeSyntax
+  Cabal.UnliftedFFITypes -> Ghc.UnliftedFFITypes
+  Cabal.ViewPatterns -> Ghc.ViewPatterns
+  -- TODO: why doesn't ghc-boot-th have these extensions?
+  Cabal.NamedFieldPuns -> Ghc.RecordPuns
+  Cabal.PatternSignatures -> Ghc.ScopedTypeVariables
+  Cabal.Rank2Types -> Ghc.RankNTypes
+  _ -> trace ("cabalExtensionToGhcExtension: ignoring unknown extension: " <> show x) Ghc.TraditionalRecordSyntax
+  -- _ -> error $ "cabalExtensionToGhcExtension: " <> show x
 
 server connection = do
   puts "starting server"

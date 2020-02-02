@@ -15,6 +15,7 @@ executable monadoc
     , cryptonite
     , filepath
     , ghc
+    , ghc-boot-th
     , http-client
     , http-client-tls
     , http-types
