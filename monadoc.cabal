@@ -12,6 +12,7 @@ executable monadoc
     , bytestring
     , Cabal
     , containers
+    , cpphs
     , cryptonite
     , filepath
     , ghc

@@ -228,10 +228,32 @@ to download all that from hackage again, but there's no point.
   that we get the wired in package. (can you even reinstall the `ghc` package
   anyway?) https://github.com/haskell-infra/hackage-trustees/issues/240
 
+- [ ] cpp?
+
+- [ ] template haskell?
+
+- [ ] backpack? https://gitlab.haskell.org/ghc/ghc/wikis/backpack
+
+- [ ] do haskell source files have to be utf-8? the parsing functions exposed
+  by ghc take strings, which don't have an encoding. how am i supposed to
+  convert the binary files into text? utf-8 makes sense but maybe it's not
+  technically required.
+
+- [ ] how to handle things that used to not require extensions but now do? for
+  example, this files uses "magic hash" identifiers but doesn't enable the
+  extension. apparently when it was written that was okay.
+  AC-Colour-1.1.1\Data\Colour\FastFloor.hs
+
+- [ ] figure out how to properly collect all language extensions from both the
+  cabal file and the module. i thought i had this right but it doesn't seem to
+  be working.
+
 -}
 
 {-# language OverloadedStrings #-}
 
+import Bag
+import CmdLineParser
 import Codec.Archive.Tar
 import Codec.Archive.Tar.Entry
 import Codec.Compression.GZip
@@ -276,6 +298,7 @@ import Fingerprint
 import GHC.LanguageExtensions.Type as Ghc
 import HeaderInfo
 import Language.Haskell.Extension as Cabal
+import Language.Preprocessor.Cpphs
 import Lexer
 import Lucid
 import Network.HTTP.Client hiding (decompress, withConnection)
@@ -286,6 +309,7 @@ import Network.Wai hiding (requestHeaders, responseHeaders, responseStatus)
 import Network.Wai.Handler.Warp
 import Network.Wai.Middleware.RequestLogger
 import Numeric.Natural
+import Outputable hiding ((<>))
 import Parser
 import Platform
 import Prelude hiding (read)
@@ -495,10 +519,7 @@ worker connection = do
       "select name, version, revision, digest from packages\
       \ order by name asc, version asc, revision asc\
       \ limit 100 /* TODO */"
-    goodVar <- newTVarIO (0 :: Natural)
-    badVar <- newTVarIO (0 :: Natural)
     forM_ rows $ \ (name, version, revision, packageDigest) -> do
-      puts $ unwords [ name, version, show revision ]
       [Only package] <- query connection
         "select content from blobs where digest = ?" $ Only packageDigest
       [Only tarballDigest] <- query connection
@@ -568,7 +589,7 @@ worker connection = do
           let
             buildInfo = libBuildInfo $ condTreeData lib
             packageDynFlags = foldr
-              (\ ext flg -> case ext of
+              (\ ext flg -> traceShow ext $ case ext of
                 EnableExtension x -> xopt_set flg $ cabalExtensionToGhcExtension x
                 DisableExtension x -> xopt_unset flg $ cabalExtensionToGhcExtension x
                 _ -> error $ show ext)
@@ -578,7 +599,7 @@ worker connection = do
               case hsSourceDirs $ buildInfo of
                 [] -> ["."]
                 xs -> xs
-            exts = [ "hs" {- , "lhs", "hsc", "chs" -} ]
+            exts = [ "hs", "lhs", "hsc", "chs" ]
           forM_ (exposedModules $ condTreeData lib) $ \ mod -> do
             atomically
               . modifyTVar' modsVar
@@ -588,29 +609,56 @@ worker connection = do
               $ fmap (\ ext -> addExtension (toFilePath mod) ext) exts
           mods <- readTVarIO modsVar
           forM_ (M.toList mods) $ \ (mod, maybePath) -> case maybePath of
-            Nothing -> pure () -- TODO: couldn't find module source
+            Nothing -> do
+              putStrLn "# failed to find source for module"
+              putStrLn $ "- package: " <> name
+              putStrLn $ "  version: " <> version
+              putStrLn $ "  revision: " <> show revision
+              putStrLn $ "  module: " <> show mod
+              putStrLn "  files:"
+              mapM_ (\ f -> putStrLn $ "  - " <> f) $ M.keys files
+              putStrLn "# press enter to continue"
+              void getLine
+              pure () -- TODO: couldn't find module source
             Just filePath -> case M.lookup filePath files of
               Nothing -> fail $ "module mapped to file that doesn't exist " <> show (mod, maybePath, files)
               Just content -> handle (\ e -> hPrint stderr (name, version, revision, mod, filePath, e :: SomeException)) $ do
                 let
-                  -- TODO: do haskell source files have to be utf-8?
+                  string :: String
+                  string = T.unpack . decodeUtf8With lenientDecode $ L.toStrict content
                   stringBuffer :: StringBuffer
-                  stringBuffer = stringToStringBuffer . T.unpack . decodeUtf8With lenientDecode $ L.toStrict content
+                  stringBuffer = stringToStringBuffer string
                   options :: [Located String]
                   options = getOptions packageDynFlags stringBuffer filePath
                   realSrcLoc :: RealSrcLoc
                   realSrcLoc = mkRealSrcLoc (mkFastString filePath) 1 1
-                (modDynFlags, _, _) <- parseDynamicFilePragma packageDynFlags options
-                let
-                  pState :: PState
-                  pState = mkPState modDynFlags stringBuffer realSrcLoc
+                (modDynFlags, arguments, warnings) <- parseDynamicFilePragma packageDynFlags options
+                unless (null arguments) $ print ("arguments", fmap unLoc arguments)
+                unless (null warnings) $ print ("warnings", fmap (\ w -> (warnReason w, unLoc $ warnMsg w)) warnings)
+                pState <- if xopt Cpp packageDynFlags || xopt Cpp modDynFlags
+                  then do
+                    newString <- runCpphs defaultCpphsOptions filePath string
+                    let newStringbuffer = stringToStringBuffer newString
+                    pure $ mkPState packageDynFlags newStringbuffer realSrcLoc
+                  else pure $ mkPState packageDynFlags stringBuffer realSrcLoc
                 case unP parseModule pState of
-                  -- TODO
-                  PFailed _ _ _ -> atomically $ modifyTVar' badVar (+ 1)
-                  POk _ _ -> atomically $ modifyTVar' goodVar (+ 1)
-    good <- readTVarIO goodVar
-    bad <- readTVarIO badVar
-    print ("good", good, "bad", bad)
+                  PFailed makeMessages srcSpan msgDoc -> do
+                    putStrLn "# failed to parse module"
+                    putStrLn $ "- package: " <> name
+                    putStrLn $ "  version: " <> version
+                    putStrLn $ "  revision: " <> show revision
+                    putStrLn $ "  module: " <> show mod
+                    putStrLn $ "  file: " <> filePath
+                    let (warnings, errors) = makeMessages packageDynFlags
+                    putStrLn $ "  warnings: " <> show (bagToList warnings)
+                    putStrLn $ "  errors: " <> show (bagToList errors)
+                    putStrLn $ "  location: " <> show srcSpan
+                    putStrLn $ "  error: " <> showSDocUnsafe msgDoc
+                    putStrLn "# press enter to continue"
+                    void getLine
+                    pure () -- TODO: failed to parse module
+                  POk _ _ -> do
+                    pure () -- TODO: successfully parsed module
 
     puts "worker finished, waiting one minute"
     threadDelay 60000000
